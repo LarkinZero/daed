@@ -1,4 +1,4 @@
-name: Build daed Debian AMD64
+name: Build daed for Debian 13 AMD64
 
 on:
   workflow_dispatch:
@@ -6,123 +6,117 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: daed-debian-build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v1
+      CGO_ENABLED: '0'
+      NODE_OPTIONS: --max-old-space-size=4096
+      HUSKY: '0'
 
     steps:
-      - name: Checkout
+      - name: Checkout source and submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: '22'
+          cache: pnpm
 
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack install
-
-      - name: Setup Go
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
           cache: false
 
-      - name: Install dependencies
+      - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            make \
-            clang \
-            llvm \
-            libbpf-dev \
-            libarchive-tools
+          sudo apt-get install -y ruby ruby-dev build-essential libarchive-tools
+          sudo gem install fpm -v 1.15.1 --no-document
 
-      - name: Build frontend
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
+      - name: Set build version
+        run: |
+          echo "PACKAGE_VERSION=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "VERSION=v0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Build web UI
         run: |
           pnpm install --frozen-lockfile
           pnpm build --filter daed
+          mkdir -p dist
+          cp -a apps/web/dist/. dist/
 
-      - name: Build daed
+      - name: Build daed (includes dae-wing and dae core)
         env:
-          GOOS: linux
-          GOARCH: amd64
-          GOAMD64: v1
-          CGO_ENABLED: 0
+          GOFLAGS: -trimpath -modcacherw
+          OUTPUT: bundled/daed-linux-x86_64
         run: |
-          make VERSION=self-build OUTPUT=daed
+          mkdir -p bundled
+          make
 
-          chmod +x daed
-          ./daed --version
-
-      - name: Package DEB
+      - name: Prepare package files
         run: |
-          VERSION="0.0.${GITHUB_RUN_NUMBER}"
-          PKG="daed_${VERSION}_amd64"
+          cp install/daed.service install/daed.desktop bundled/
+          cp -a install/icons bundled/
+          curl --fail --location --retry 3 -o bundled/geoip.dat \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
+          curl --fail --location --retry 3 -o bundled/geosite.dat \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
 
-          mkdir -p "$PKG/DEBIAN"
-          mkdir -p "$PKG/usr/bin"
-          mkdir -p "$PKG/usr/lib/systemd/system"
-          mkdir -p "$PKG/usr/share/daed"
-
-          install -m755 daed "$PKG/usr/bin/daed"
-
-          install -m644 \
-            install/daed.service \
-            "$PKG/usr/lib/systemd/system/daed.service"
-
-          curl -fL \
-            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat \
-            -o "$PKG/usr/share/daed/geoip.dat"
-
-          curl -fL \
-            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat \
-            -o "$PKG/usr/share/daed/geosite.dat"
-
-          cat > "$PKG/DEBIAN/control" <<EOF
-          Package: daed
-          Version: $VERSION
-          Section: net
-          Priority: optional
-          Architecture: amd64
-          Maintainer: Self Build <noreply@example.com>
-          Description: daed transparent proxy dashboard
-          EOF
-
-          cat > "$PKG/DEBIAN/postinst" <<'EOF'
-          #!/bin/sh
-          set -e
-          systemctl daemon-reload || true
-          exit 0
-          EOF
-
-          chmod 755 "$PKG/DEBIAN/postinst"
-
-          dpkg-deb --build "$PKG"
-
+      - name: Package Debian DEB using upstream scripts
+        run: |
           mkdir -p output
-          mv "$PKG.deb" output/
+          cd bundled
+          fpm -s dir -t deb -a amd64 \
+            --version "$PACKAGE_VERSION" \
+            --name daed \
+            --license 'MIT AGPL' \
+            --url 'https://github.com/daeuniverse/daed' \
+            --description 'daed, a modern dashboard for dae' \
+            --maintainer 'Self build' \
+            --package '../output/installer-daed-linux-x86_64.deb' \
+            --after-install ../install/package_after_install.sh \
+            --after-remove ../install/package_after_remove.sh \
+            ./geoip.dat=/usr/share/daed/geoip.dat \
+            ./geosite.dat=/usr/share/daed/geosite.dat \
+            ./daed.service=/usr/lib/systemd/system/daed.service \
+            ./daed.desktop=/usr/share/applications/daed.desktop \
+            ./icons/16x16.png=/usr/share/icons/hicolor/16x16/apps/daed.png \
+            ./icons/32x32.png=/usr/share/icons/hicolor/32x32/apps/daed.png \
+            ./icons/64x64.png=/usr/share/icons/hicolor/64x64/apps/daed.png \
+            ./icons/128x128.png=/usr/share/icons/hicolor/128x128/apps/daed.png \
+            ./icons/256x256.png=/usr/share/icons/hicolor/256x256/apps/daed.png \
+            ./icons/512x512.png=/usr/share/icons/hicolor/512x512/apps/daed.png \
+            ./icons/1024x1024.png=/usr/share/icons/hicolor/1024x1024/apps/daed.png \
+            ./daed-linux-x86_64=/usr/bin/daed
 
-      - name: Upload Artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: daed-debian-amd64
+          name: daed-debian13-amd64
           path: output/*.deb
 
-      - name: Publish Release
+      - name: Publish GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="build-${GITHUB_RUN_NUMBER}"
-
-          gh release create "$TAG" \
-            output/*.deb \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "daed Build ${GITHUB_RUN_NUMBER}" \
-            --notes "Automated Debian AMD64 build."
+          TAG="debian13-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" output/*.deb \
+            --target "$GITHUB_SHA" \
+            --title "daed Debian 13 AMD64 build ${GITHUB_RUN_NUMBER}" \
+            --notes "Self-built Linux AMD64 v1 package from commit ${GITHUB_SHA}. Intended for Debian 13."
