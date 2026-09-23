@@ -1,0 +1,128 @@
+name: Build daed Debian AMD64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack install
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            make \
+            clang \
+            llvm \
+            libbpf-dev \
+            libarchive-tools
+
+      - name: Build frontend
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build --filter daed
+
+      - name: Build daed
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1
+          CGO_ENABLED: 0
+        run: |
+          make VERSION=self-build OUTPUT=daed
+
+          chmod +x daed
+          ./daed --version
+
+      - name: Package DEB
+        run: |
+          VERSION="0.0.${GITHUB_RUN_NUMBER}"
+          PKG="daed_${VERSION}_amd64"
+
+          mkdir -p "$PKG/DEBIAN"
+          mkdir -p "$PKG/usr/bin"
+          mkdir -p "$PKG/usr/lib/systemd/system"
+          mkdir -p "$PKG/usr/share/daed"
+
+          install -m755 daed "$PKG/usr/bin/daed"
+
+          install -m644 \
+            install/daed.service \
+            "$PKG/usr/lib/systemd/system/daed.service"
+
+          curl -fL \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat \
+            -o "$PKG/usr/share/daed/geoip.dat"
+
+          curl -fL \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat \
+            -o "$PKG/usr/share/daed/geosite.dat"
+
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: daed
+          Version: $VERSION
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Self Build <noreply@example.com>
+          Description: daed transparent proxy dashboard
+          EOF
+
+          cat > "$PKG/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          systemctl daemon-reload || true
+          exit 0
+          EOF
+
+          chmod 755 "$PKG/DEBIAN/postinst"
+
+          dpkg-deb --build "$PKG"
+
+          mkdir -p output
+          mv "$PKG.deb" output/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-debian-amd64
+          path: output/*.deb
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${GITHUB_RUN_NUMBER}"
+
+          gh release create "$TAG" \
+            output/*.deb \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "daed Build ${GITHUB_RUN_NUMBER}" \
+            --notes "Automated Debian AMD64 build."
